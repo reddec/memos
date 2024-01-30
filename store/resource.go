@@ -1,13 +1,17 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 
 	"github.com/pkg/errors"
 
+	"github.com/usememos/memos/internal/resources"
 	"github.com/usememos/memos/internal/util"
 )
 
@@ -19,6 +23,7 @@ const (
 type Resource struct {
 	ID           int32
 	ResourceName string
+	StorageID    *int32
 
 	// Standard fields
 	CreatorID int32
@@ -54,6 +59,7 @@ type UpdateResource struct {
 	Filename     *string
 	InternalPath *string
 	ExternalLink *string
+	StorageID    *int32
 	MemoID       *int32
 	Blob         []byte
 }
@@ -119,4 +125,50 @@ func (s *Store) DeleteResource(ctx context.Context, delete *DeleteResource) erro
 		_ = os.Remove(thumbnailPath)
 	}
 	return s.driver.DeleteResource(ctx, delete)
+}
+
+func (s *Store) GetResourceContent(ctx context.Context, r *Resource) (io.ReadCloser, error) {
+	// try new approach
+	if r.StorageID != nil {
+		storage, err := s.GetStorage(ctx, &FindStorage{ID: r.StorageID})
+		if err != nil {
+			return nil, errors.Wrapf(err, "find storage %d", *r.StorageID)
+		}
+		return resources.Content(ctx, storage.Type, storage.Config, r.ExternalLink)
+	}
+	if r.Blob != nil {
+		// embedded to DB
+		return io.NopCloser(bytes.NewReader(r.Blob)), nil
+	}
+	// legacy
+	//
+	if r.InternalPath != "" {
+		// local file
+		resourcePath := filepath.FromSlash(r.InternalPath)
+		if !filepath.IsAbs(resourcePath) {
+			resourcePath = filepath.Join(s.Profile.Data, resourcePath)
+		}
+		return os.Open(resourcePath)
+	}
+	if r.ExternalLink != "" {
+		// external file
+		return openLink(ctx, r.ExternalLink)
+	}
+	return nil, os.ErrNotExist
+}
+
+func openLink(ctx context.Context, url string) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, errors.Wrapf(err, "create request to %q", url)
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, errors.Wrapf(err, "execute request to %q", url)
+	}
+	if res.StatusCode/100 != 2 {
+		_ = res.Body.Close()
+		return nil, errors.Errorf("status code %d", res.StatusCode)
+	}
+	return res.Body, nil
 }

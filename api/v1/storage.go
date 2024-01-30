@@ -7,6 +7,8 @@ import (
 
 	"github.com/labstack/echo/v4"
 
+	"github.com/usememos/memos/internal/resources/local"
+	"github.com/usememos/memos/internal/resources/s3"
 	"github.com/usememos/memos/internal/util"
 	"github.com/usememos/memos/store"
 )
@@ -23,7 +25,8 @@ const (
 type StorageType string
 
 const (
-	StorageS3 StorageType = "S3"
+	StorageS3    StorageType = s3.Name
+	StorageLocal StorageType = local.Name
 )
 
 func (t StorageType) String() string {

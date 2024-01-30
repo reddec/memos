@@ -1,12 +1,12 @@
 package resource
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -45,6 +45,28 @@ func NewResourceService(profile *profile.Profile, store *store.Store) *ResourceS
 func (s *ResourceService) RegisterRoutes(g *echo.Group) {
 	g.GET("/r/:resourceName", s.streamResource)
 	g.GET("/r/:resourceName/*", s.streamResource)
+	g.GET("/s/:resourceID", s.streamResourceByID)
+}
+
+func (s *ResourceService) streamResourceByID(c echo.Context) error {
+	ctx := c.Request().Context()
+	resourceRawID := c.Param("resourceID")
+	resourceID, err := strconv.Atoi(resourceRawID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, fmt.Errorf("resource ID %q is not integer", resourceRawID)).SetInternal(err)
+	}
+	var id = int32(resourceID)
+	resource, err := s.Store.GetResource(ctx, &store.FindResource{
+		ID:      &id,
+		GetBlob: true,
+	})
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to find resource by id: %d", resourceID)).SetInternal(err)
+	}
+	if resource == nil {
+		return echo.NewHTTPError(http.StatusNotFound, fmt.Sprintf("Resource not found: %d", resourceID))
+	}
+	return s.streamResourceContent(c, resource)
 }
 
 func (s *ResourceService) streamResource(c echo.Context) error {
@@ -60,6 +82,11 @@ func (s *ResourceService) streamResource(c echo.Context) error {
 	if resource == nil {
 		return echo.NewHTTPError(http.StatusNotFound, fmt.Sprintf("Resource not found: %s", resourceName))
 	}
+	return s.streamResourceContent(c, resource)
+}
+
+func (s *ResourceService) streamResourceContent(c echo.Context, resource *store.Resource) error {
+	ctx := c.Request().Context()
 	// Check the related memo visibility.
 	if resource.MemoID != nil {
 		memo, err := s.Store.GetMemo(ctx, &store.FindMemo{
@@ -76,32 +103,28 @@ func (s *ResourceService) streamResource(c echo.Context) error {
 		}
 	}
 
-	blob := resource.Blob
-	if resource.InternalPath != "" {
-		resourcePath := filepath.FromSlash(resource.InternalPath)
-		if !filepath.IsAbs(resourcePath) {
-			resourcePath = filepath.Join(s.Profile.Data, resourcePath)
-		}
-
-		src, err := os.Open(resourcePath)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to open the local resource: %s", resourcePath)).SetInternal(err)
-		}
-		defer src.Close()
-		blob, err = io.ReadAll(src)
-		if err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, fmt.Sprintf("Failed to read the local resource: %s", resourcePath)).SetInternal(err)
-		}
+	resourceStream, err := s.Store.GetResourceContent(ctx, resource)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get resource").SetInternal(err)
 	}
+	defer resourceStream.Close()
 
 	if c.QueryParam("thumbnail") == "1" && util.HasPrefixes(resource.Type, "image/png", "image/jpeg") {
 		ext := filepath.Ext(resource.Filename)
 		thumbnailPath := filepath.Join(s.Profile.Data, thumbnailImagePath, fmt.Sprintf("%d%s", resource.ID, ext))
-		thumbnailBlob, err := getOrGenerateThumbnailImage(blob, thumbnailPath)
+		thumbnailImage, err := getOrGenerateThumbnailImage(resourceStream, thumbnailPath)
+		_ = resourceStream.Close() // we have to close stream anyway regardless of outcome
 		if err != nil {
 			log.Warn(fmt.Sprintf("failed to get or generate local thumbnail with path %s", thumbnailPath), zap.Error(err))
+			// re-open stream and stream original content
+			resourceStream, err = s.Store.GetResourceContent(ctx, resource)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, "Failed to get resource").SetInternal(err)
+			}
+			defer resourceStream.Close()
 		} else {
-			blob = thumbnailBlob
+			defer thumbnailImage.Close()
+			resourceStream = thumbnailImage
 		}
 	}
 
@@ -111,16 +134,18 @@ func (s *ResourceService) streamResource(c echo.Context) error {
 	resourceType := strings.ToLower(resource.Type)
 	if strings.HasPrefix(resourceType, "text") {
 		resourceType = echo.MIMETextPlainCharsetUTF8
-	} else if strings.HasPrefix(resourceType, "video") || strings.HasPrefix(resourceType, "audio") {
-		http.ServeContent(c.Response(), c.Request(), resource.Filename, time.Unix(resource.UpdatedTs, 0), bytes.NewReader(blob))
+	}
+	if seeker, supportsSeek := resourceStream.(io.ReadSeeker); supportsSeek {
+		// always serve content regardless of content type
+		http.ServeContent(c.Response(), c.Request(), resource.Filename, time.Unix(resource.UpdatedTs, 0), seeker)
 		return nil
 	}
-	return c.Stream(http.StatusOK, resourceType, bytes.NewReader(blob))
+	return c.Stream(http.StatusOK, resourceType, resourceStream)
 }
 
 var availableGeneratorAmount int32 = 32
 
-func getOrGenerateThumbnailImage(srcBlob []byte, dstPath string) ([]byte, error) {
+func getOrGenerateThumbnailImage(source io.Reader, dstPath string) (io.ReadCloser, error) {
 	if _, err := os.Stat(dstPath); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return nil, errors.Wrap(err, "failed to check thumbnail image stat")
@@ -134,8 +159,7 @@ func getOrGenerateThumbnailImage(srcBlob []byte, dstPath string) ([]byte, error)
 			atomic.AddInt32(&availableGeneratorAmount, 1)
 		}()
 
-		reader := bytes.NewReader(srcBlob)
-		src, err := imaging.Decode(reader, imaging.AutoOrientation(true))
+		src, err := imaging.Decode(source, imaging.AutoOrientation(true))
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to decode thumbnail image")
 		}
@@ -151,14 +175,5 @@ func getOrGenerateThumbnailImage(srcBlob []byte, dstPath string) ([]byte, error)
 		}
 	}
 
-	dstFile, err := os.Open(dstPath)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to open the local resource")
-	}
-	defer dstFile.Close()
-	dstBlob, err := io.ReadAll(dstFile)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to read the local resource")
-	}
-	return dstBlob, nil
+	return os.Open(dstPath)
 }

@@ -2,26 +2,25 @@ package v1
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
-	"regexp"
+	"path"
 	"strconv"
-	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/labstack/echo/v4"
 	"github.com/lithammer/shortuuid/v4"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 
 	"github.com/usememos/memos/internal/log"
+	"github.com/usememos/memos/internal/resources"
 	"github.com/usememos/memos/internal/util"
-	"github.com/usememos/memos/plugin/storage/s3"
 	"github.com/usememos/memos/server/service/metric"
 	"github.com/usememos/memos/store"
 )
@@ -67,8 +66,6 @@ const (
 	maxUploadBufferSizeBytes = 32 << 20
 	MebiByte                 = 1024 * 1024
 )
-
-var fileKeyPattern = regexp.MustCompile(`\{[a-z]{1,9}\}`)
 
 func (s *APIV1Service) registerResourceRoutes(g *echo.Group) {
 	g.GET("/resource", s.GetResourceList)
@@ -339,34 +336,6 @@ func (s *APIV1Service) UpdateResource(c echo.Context) error {
 	return c.JSON(http.StatusOK, convertResourceFromStore(resource))
 }
 
-func replacePathTemplate(path, filename string) string {
-	t := time.Now()
-	path = fileKeyPattern.ReplaceAllStringFunc(path, func(s string) string {
-		switch s {
-		case "{filename}":
-			return filename
-		case "{timestamp}":
-			return fmt.Sprintf("%d", t.Unix())
-		case "{year}":
-			return fmt.Sprintf("%d", t.Year())
-		case "{month}":
-			return fmt.Sprintf("%02d", t.Month())
-		case "{day}":
-			return fmt.Sprintf("%02d", t.Day())
-		case "{hour}":
-			return fmt.Sprintf("%02d", t.Hour())
-		case "{minute}":
-			return fmt.Sprintf("%02d", t.Minute())
-		case "{second}":
-			return fmt.Sprintf("%02d", t.Second())
-		case "{uuid}":
-			return util.GenUUID()
-		}
-		return s
-	})
-	return path
-}
-
 func convertResourceFromStore(resource *store.Resource) *Resource {
 	return &Resource{
 		ID:           resource.ID,
@@ -403,100 +372,39 @@ func SaveResourceBlob(ctx context.Context, s *store.Store, create *store.Resourc
 		}
 	}
 
-	// `DatabaseStorage` means store blob into database
+	// corner case - storage in DB
 	if storageServiceID == DatabaseStorage {
 		fileBytes, err := io.ReadAll(r)
 		if err != nil {
-			return errors.Wrap(err, "Failed to read file")
+			return errors.Wrap(err, "failed to read upload")
 		}
 		create.Blob = fileBytes
 		return nil
-	} else if storageServiceID == LocalStorage {
-		// `LocalStorage` means save blob into local disk
-		systemSettingLocalStoragePath, err := s.GetWorkspaceSetting(ctx, &store.FindWorkspaceSetting{Name: SystemSettingLocalStoragePathName.String()})
-		if err != nil {
-			return errors.Wrap(err, "Failed to find SystemSettingLocalStoragePathName")
-		}
-		localStoragePath := "assets/{timestamp}_{filename}"
-		if systemSettingLocalStoragePath != nil && systemSettingLocalStoragePath.Value != "" {
-			err = json.Unmarshal([]byte(systemSettingLocalStoragePath.Value), &localStoragePath)
-			if err != nil {
-				return errors.Wrap(err, "Failed to unmarshal SystemSettingLocalStoragePathName")
-			}
-		}
-
-		internalPath := localStoragePath
-		if !strings.Contains(internalPath, "{filename}") {
-			internalPath = filepath.Join(internalPath, "{filename}")
-		}
-		internalPath = replacePathTemplate(internalPath, create.Filename)
-		internalPath = filepath.ToSlash(internalPath)
-		create.InternalPath = internalPath
-
-		osPath := filepath.FromSlash(internalPath)
-		if !filepath.IsAbs(osPath) {
-			osPath = filepath.Join(s.Profile.Data, osPath)
-		}
-		dir := filepath.Dir(osPath)
-		if err = os.MkdirAll(dir, os.ModePerm); err != nil {
-			return errors.Wrap(err, "Failed to create directory")
-		}
-		dst, err := os.Create(osPath)
-		if err != nil {
-			return errors.Wrap(err, "Failed to create file")
-		}
-		defer dst.Close()
-		_, err = io.Copy(dst, r)
-		if err != nil {
-			return errors.Wrap(err, "Failed to copy file")
-		}
-
-		return nil
 	}
-
-	// Others: store blob into external service, such as S3
+	// normally it should be stored in one of providers
 	storage, err := s.GetStorage(ctx, &store.FindStorage{ID: &storageServiceID})
 	if err != nil {
-		return errors.Wrap(err, "Failed to find StorageServiceID")
+		return errors.Wrapf(err, "find storage %d", storageServiceID)
 	}
-	if storage == nil {
-		return errors.Errorf("Storage %d not found", storageServiceID)
-	}
-	storageMessage, err := ConvertStorageFromStore(storage)
+	provider, err := resources.CreateProvider(storage.Name, []byte(storage.Config))
 	if err != nil {
-		return errors.Wrap(err, "Failed to ConvertStorageFromStore")
+		return errors.Wrapf(err, "create storage %d", storageServiceID)
 	}
-
-	if storageMessage.Type != StorageS3 {
-		return errors.Errorf("Unsupported storage type: %s", storageMessage.Type)
+	create.StorageID = &storageServiceID // save link to storage
+	resourceKey := generateResourceID()
+	if err := provider.Upload(ctx, resourceKey, r); err != nil {
+		return errors.Wrapf(err, "upload to %d (%s)", storageServiceID, storage.Name)
 	}
-
-	s3Config := storageMessage.Config.S3Config
-	s3Client, err := s3.NewClient(ctx, &s3.Config{
-		AccessKey: s3Config.AccessKey,
-		SecretKey: s3Config.SecretKey,
-		EndPoint:  s3Config.EndPoint,
-		Region:    s3Config.Region,
-		Bucket:    s3Config.Bucket,
-		URLPrefix: s3Config.URLPrefix,
-		URLSuffix: s3Config.URLSuffix,
-		PreSign:   s3Config.PreSign,
-	})
-	if err != nil {
-		return errors.Wrap(err, "Failed to create s3 client")
-	}
-
-	filePath := s3Config.Path
-	if !strings.Contains(filePath, "{filename}") {
-		filePath = filepath.Join(filePath, "{filename}")
-	}
-	filePath = replacePathTemplate(filePath, create.Filename)
-
-	link, err := s3Client.UploadFile(ctx, filePath, create.Type, r)
-	if err != nil {
-		return errors.Wrap(err, "Failed to upload via s3 client")
-	}
-
-	create.ExternalLink = link
+	create.ExternalLink = resourceKey
 	return nil
+}
+
+func generateResourceID() string {
+	const chunk = 2
+	uid := uuid.New()
+	id := hex.EncodeToString(uid[:])
+	// make aggregation by two symbol three time in order to reduce load on underlying storage
+	// foobarbaz -> fo/ob/ar/baz
+	key := path.Join(id[:chunk], id[chunk:chunk*2], id[chunk*2:chunk*3], id[chunk*3:])
+	return key
 }

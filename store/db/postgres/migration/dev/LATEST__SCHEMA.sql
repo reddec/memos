@@ -74,7 +74,8 @@ CREATE TABLE resource (
   type TEXT NOT NULL DEFAULT '',
   size INTEGER NOT NULL DEFAULT 0,
   internal_path TEXT NOT NULL DEFAULT '',
-  memo_id INTEGER DEFAULT NULL
+  memo_id INTEGER DEFAULT NULL,
+  storage_id INTEGER DEFAULT NULL REFERENCES storage(id)
 );
 
 -- tag

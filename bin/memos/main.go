@@ -12,7 +12,9 @@ import (
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 
-	"github.com/usememos/memos/internal/jobs"
+	"github.com/usememos/memos/internal/resources"
+	"github.com/usememos/memos/internal/resources/local"
+	"github.com/usememos/memos/internal/resources/s3"
 
 	"github.com/usememos/memos/internal/log"
 	"github.com/usememos/memos/server"
@@ -79,6 +81,10 @@ var (
 				metric.NewMetricClient(s.ID, *profile)
 			}
 
+			// initialize providers lists
+			resources.RegisterProvider(local.Name, local.New)
+			resources.RegisterProvider(s3.Name, s3.New)
+
 			c := make(chan os.Signal, 1)
 			// Trigger graceful shutdown on SIGINT or SIGTERM.
 			// The default signal sent by the `kill` command is SIGTERM,
@@ -91,10 +97,13 @@ var (
 				cancel()
 			}()
 
-			printGreetings()
+			// storage migration - can be interrupted
+			if err := store.MigrateLocalResourcesToStorages(ctx, storeInstance); err != nil {
+				log.Error("failed to migrate local storages", zap.Error(err))
+				return
+			}
 
-			// update (pre-sign) object storage links if applicable
-			go jobs.RunPreSignLinks(ctx, storeInstance)
+			printGreetings()
 
 			if err := s.Start(ctx); err != nil {
 				if err != http.ErrServerClosed {

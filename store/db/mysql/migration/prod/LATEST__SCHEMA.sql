@@ -74,7 +74,8 @@ CREATE TABLE `resource` (
   `type` VARCHAR(256) NOT NULL DEFAULT '',
   `size` INT NOT NULL DEFAULT '0',
   `internal_path` VARCHAR(256) NOT NULL DEFAULT '',
-  `memo_id` INT DEFAULT NULL
+  `memo_id` INT DEFAULT NULL,
+  `storage_id` INT DEFAULT NULL
 );
 
 -- tag

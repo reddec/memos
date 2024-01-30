@@ -10,9 +10,9 @@ import (
 )
 
 func (d *DB) CreateResource(ctx context.Context, create *store.Resource) (*store.Resource, error) {
-	fields := []string{"`resource_name`", "`filename`", "`blob`", "`external_link`", "`type`", "`size`", "`creator_id`", "`internal_path`", "`memo_id`"}
+	fields := []string{"`resource_name`", "`filename`", "`blob`", "`external_link`", "`type`", "`size`", "`creator_id`", "`internal_path`", "`memo_id`", "`storage_id`"}
 	placeholder := []string{"?", "?", "?", "?", "?", "?", "?", "?", "?"}
-	args := []any{create.ResourceName, create.Filename, create.Blob, create.ExternalLink, create.Type, create.Size, create.CreatorID, create.InternalPath, create.MemoID}
+	args := []any{create.ResourceName, create.Filename, create.Blob, create.ExternalLink, create.Type, create.Size, create.CreatorID, create.InternalPath, create.MemoID, create.StorageID}
 
 	stmt := "INSERT INTO `resource` (" + strings.Join(fields, ", ") + ") VALUES (" + strings.Join(placeholder, ", ") + ") RETURNING `id`, `created_ts`, `updated_ts`"
 	if err := d.db.QueryRowContext(ctx, stmt, args...).Scan(&create.ID, &create.CreatedTs, &create.UpdatedTs); err != nil {
@@ -44,7 +44,7 @@ func (d *DB) ListResources(ctx context.Context, find *store.FindResource) ([]*st
 		where = append(where, "`memo_id` IS NOT NULL")
 	}
 
-	fields := []string{"`id`", "`resource_name`", "`filename`", "`external_link`", "`type`", "`size`", "`creator_id`", "`created_ts`", "`updated_ts`", "`internal_path`", "`memo_id`"}
+	fields := []string{"`id`", "`resource_name`", "`filename`", "`external_link`", "`type`", "`size`", "`creator_id`", "`created_ts`", "`updated_ts`", "`internal_path`", "`memo_id`", "`storage_id`"}
 	if find.GetBlob {
 		fields = append(fields, "`blob`")
 	}
@@ -67,6 +67,7 @@ func (d *DB) ListResources(ctx context.Context, find *store.FindResource) ([]*st
 	for rows.Next() {
 		resource := store.Resource{}
 		var memoID sql.NullInt32
+		var storageID sql.NullInt32
 		dests := []any{
 			&resource.ID,
 			&resource.ResourceName,
@@ -79,6 +80,7 @@ func (d *DB) ListResources(ctx context.Context, find *store.FindResource) ([]*st
 			&resource.UpdatedTs,
 			&resource.InternalPath,
 			&memoID,
+			&storageID,
 		}
 		if find.GetBlob {
 			dests = append(dests, &resource.Blob)
@@ -88,6 +90,9 @@ func (d *DB) ListResources(ctx context.Context, find *store.FindResource) ([]*st
 		}
 		if memoID.Valid {
 			resource.MemoID = &memoID.Int32
+		}
+		if storageID.Valid {
+			resource.StorageID = &storageID.Int32
 		}
 		list = append(list, &resource)
 	}
@@ -119,6 +124,9 @@ func (d *DB) UpdateResource(ctx context.Context, update *store.UpdateResource) (
 	}
 	if v := update.MemoID; v != nil {
 		set, args = append(set, "`memo_id` = ?"), append(args, *v)
+	}
+	if v := update.StorageID; v != nil {
+		set, args = append(set, "`storage_id` = ?"), append(args, *v)
 	}
 	if v := update.Blob; v != nil {
 		set, args = append(set, "`blob` = ?"), append(args, v)
